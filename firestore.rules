@@ -1,0 +1,808 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // دالة مساعدة: التحقق من أن المستخدم admin
+    function isAdmin() {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == "admin";
+    }
+    
+    // قراءة عامة للأطباء (لإظهار الاسم وحالة التوفر)، الكتابة للطبيب نفسه فقط أو admin
+    match /doctors/{uid} {
+      allow read: if true;
+      allow write: if request.auth != null && (request.auth.uid == uid || isAdmin());
+    }
+
+    // منشورات اليوميات: القراءة عامة لجميع المنشورات (لإظهارها بشكل blur للزوار)
+    match /diary/{entryId} {
+      // السماح بقراءة جميع المنشورات (public و private) للجميع
+      // سيتم تطبيق blur في الواجهة للمستخدمين غير المسجلين
+      allow read: if true;
+      // الكتابة للمستخدمين الموثقين فقط (مرضى وأطباء)
+      // المرضى يحتاجون patientId، الأطباء لا يحتاجونه
+      allow create: if request.auth != null && (
+        // للمرضى: يجب أن يكون patientId موجوداً في request
+        (request.resource.data.keys().hasAll(['patientId']) && 
+         request.resource.data.patientId != null) ||
+        // للأطباء: authorRole يجب أن يكون "doctor"
+        (request.resource.data.authorRole == "doctor")
+      );
+      // التحديث: السماح لصاحب المنشور أو admin بتحديث أي شيء
+      // السماح لأي مستخدم موثق بتحديث likedBy وlikesCount فقط (للإعجابات)
+      allow update: if request.auth != null && (
+        // السماح لصاحب المنشور أو admin بتحديث أي شيء
+        (resource.data.authorUid == request.auth.uid || isAdmin()) ||
+        // السماح لأي مستخدم موثق بتحديث likedBy وlikesCount فقط
+        // التحقق من أن جميع الحقول الأساسية لم تتغير
+        (
+          request.resource.data.content == resource.data.content &&
+          request.resource.data.date == resource.data.date &&
+          request.resource.data.mood == resource.data.mood &&
+          request.resource.data.authorUid == resource.data.authorUid &&
+          request.resource.data.isPublic == resource.data.isPublic &&
+          request.resource.data.showAsAnonymous == resource.data.showAsAnonymous
+        )
+      );
+      // الحذف: لصاحب المنشور أو admin
+      allow delete: if request.auth != null && 
+        (resource.data.authorUid == request.auth.uid || isAdmin());
+    }
+
+    // تعليقات اليوميات: قراءة عامة للجميع (لإظهارها بشكل blur للزوار)، كتابة للمستخدمين الموثقين فقط
+    match /diaryComments/{commentId} {
+      allow read: if true;
+      allow create: if request.auth != null;
+      allow update: if request.auth != null && (resource.data.authorUid == request.auth.uid || isAdmin());
+      // الحذف: لصاحب التعليق أو admin
+      allow delete: if request.auth != null && (resource.data.authorUid == request.auth.uid || isAdmin());
+    }
+
+    // بقية المجموعات (patients, alerts, messages, assessments, etc.) محمية للمستخدمين الموثقين فقط
+    // Admin له صلاحيات كاملة
+    match /patients/{patientId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner() {
+        return request.auth != null &&
+               resource != null &&
+               resource.data.keys().hasAll(['uid']) &&
+               resource.data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor() {
+        return resource != null &&
+               resource.data.keys().hasAll(['assignedDoctor']) &&
+               resource.data.assignedDoctor == request.auth.uid &&
+               resource.data.assignedDoctor != null &&
+               resource.data.assignedDoctor != "";
+      }
+      
+      // القراءة: المريضة تقرأ ملفها، الطبيب يقرأ ملفات مرضاه، Admin يقرأ كل شيء
+      allow read: if request.auth != null && (
+        isAdmin() ||
+        isPatientOwner() ||
+        (isDoctor() && isPatientAssignedToDoctor())
+      );
+      
+      // الكتابة: المريضة تكتب ملفها فقط، الطبيب يحدث ملفات مرضاه
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['uid']) &&
+         request.resource.data.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      allow update: if request.auth != null && (
+        isPatientOwner() ||
+        (isDoctor() && isPatientAssignedToDoctor()) ||
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف بياناتها فقط أو admin
+      allow delete: if request.auth != null && (isPatientOwner() || isAdmin());
+    }
+
+    match /alerts/{alertId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['assignedDoctor']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ تنبيهاتها فقط، الطبيب يقرأ تنبيهات مرضاه، Admin يقرأ كل شيء
+      allow read: if request.auth != null && (
+        // المريضة تقرأ تنبيهاتها
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يقرأ تنبيهات مرضاه
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        // Admin يقرأ كل شيء
+        isAdmin()
+      );
+      
+      // الكتابة: المريضة والطبيب يمكنهما إنشاء التنبيهات
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         (isPatientOwner(request.resource.data.patientId) ||
+          (isDoctor() && isPatientAssignedToDoctor(request.resource.data.patientId)))) ||
+        isAdmin()
+      );
+      
+      // التحديث: نفس قواعد القراءة
+      allow update: if request.auth != null && (
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف تنبيهاتها فقط أو admin
+      allow delete: if request.auth != null && (
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // الرسائل: المريضة تقرأ/تكتب رسائلها فقط، الطبيب يقرأ رسائل مرضاه ويمكنه الكتابة
+    match /messages/{messageId} {
+      // دالة مساعدة: الحصول على patientId للمريضة الحالية (document ID في patients collection)
+      function getPatientId() {
+        // البحث عن document في patients حيث uid == request.auth.uid
+        // هذا يتطلب query، لكن Firestore rules لا تدعم queries بشكل مباشر
+        // لذلك سنستخدم طريقة أبسط: التحقق من خلال userProfiles أو السماح بقراءة/كتابة الرسائل
+        // إذا كان patientId في الرسالة يطابق document موجود في patients و uid يطابق request.auth.uid
+        return null;
+      }
+      
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['assignedDoctor']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة:
+      // - المريضة: يمكنها قراءة جميع الرسائل الخاصة بـ patientId الخاص بها (حيث uid يطابق request.auth.uid)
+      // - الطبيب: يمكنه قراءة الرسائل من المرضى الذين يتابعهم
+      // - Admin: يمكنه قراءة جميع الرسائل
+      allow read: if request.auth != null && (
+        // المريضة تقرأ رسائلها (patientId في الرسالة يطابق document في patients حيث uid == request.auth.uid)
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يقرأ رسائل مرضاه
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        // Admin يقرأ جميع الرسائل
+        isAdmin()
+      );
+      
+      // الكتابة:
+      // - المريضة: يمكنها كتابة رسائل بـ from == "patient" و patientId يطابق document في patients حيث uid == request.auth.uid
+      // - الطبيب: يمكنه كتابة رسائل بـ from == "doctor" للمرضى الذين يتابعهم
+      // - Admin: يمكنه كتابة جميع الرسائل
+      allow create: if request.auth != null && (
+        // المريضة تكتب رسالة
+        (request.resource.data.keys().hasAll(['from', 'patientId']) &&
+         request.resource.data.from == "patient" &&
+         isPatientOwner(request.resource.data.patientId)) ||
+        // الطبيب يكتب رسالة لمريضة يتابعها
+        (isDoctor() &&
+         request.resource.data.keys().hasAll(['from', 'patientId']) &&
+         request.resource.data.from == "doctor" &&
+         isPatientAssignedToDoctor(request.resource.data.patientId)) ||
+        // Admin يكتب جميع الرسائل
+        isAdmin()
+      );
+      
+      // التحديث:
+      // - المريضة: يمكنها تحديث رسائلها فقط
+      // - الطبيب: يمكنه تحديث رسائل مرضاه
+      // - Admin: يمكنه تحديث جميع الرسائل
+      allow update: if request.auth != null && (
+        // المريضة تحدث رسائلها
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يحدث رسائل مرضاه
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        // Admin يحدث جميع الرسائل
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف رسائلها فقط أو admin
+      allow delete: if request.auth != null && (
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // تقييمات المخاطر
+    match /assessments/{assessmentId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               patientId != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['uid']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return patientId != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['assignedDoctor']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ تقييماتها فقط، الطبيب يقرأ تقييمات مرضاه، Admin يمكنه قراءة كل شيء
+      // ملاحظة: عند استخدام queries، سيتم التحقق من كل document بشكل منفصل
+      allow read: if request.auth != null && (
+        // Admin يقرأ جميع التقييمات
+        isAdmin() ||
+        // المريضة تقرأ تقييماتها (patientId في التقييم يطابق document في patients حيث uid == request.auth.uid)
+        (resource != null && 
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يقرأ تقييمات مرضاه
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId))
+      );
+      
+      // الكتابة: المريضة تكتب تقييماتها فقط (patientId يطابق document في patients حيث uid == request.auth.uid)، Admin يمكنه كتابة كل شيء
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(request.resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // التحديث: المريضة تحدث تقييماتها فقط، Admin يمكنه تحديث كل شيء
+      allow update: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId) &&
+         request.resource.data.patientId == resource.data.patientId) ||
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف تقييماتها فقط أو admin
+      allow delete: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // طلبات إعادة التقييم
+    match /reassessmentRequests/{requestId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               patientId != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['uid']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return patientId != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.keys().hasAll(['assignedDoctor']) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ طلباتها فقط، الطبيب يقرأ طلبات مرضاه، Admin يمكنه قراءة كل شيء
+      allow read: if request.auth != null && (
+        // Admin يقرأ جميع الطلبات
+        isAdmin() ||
+        // المريضة تقرأ طلباتها
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يقرأ طلبات مرضاه
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId))
+      );
+      
+      // الكتابة: المريضة تكتب طلباتها فقط، Admin يمكنه كتابة كل شيء
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(request.resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // التحديث: المريضة تحدث طلباتها، الطبيب يحدث طلبات مرضاه (للموافقة/الرفض)، Admin يمكنه تحديث كل شيء
+      allow update: if request.auth != null && (
+        // المريضة تحدث طلباتها
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        // الطبيب يحدث طلبات مرضاه (للموافقة/الرفض)
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        // Admin يحدث جميع الطلبات
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف طلباتها فقط أو admin
+      allow delete: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    match /userProfiles/{uid} {
+      // المستخدم يمكنه قراءة ملفه الشخصي فقط
+      allow read: if request.auth != null && (request.auth.uid == uid || isAdmin());
+      // الكتابة: يمكن للمستخدم إنشاء ملفه الشخصي أو تحديثه، لكن لا يمكن تغيير role بعد الإنشاء
+      // Admin يمكنه إنشاء/تحديث أي ملف شخصي
+      allow create: if request.auth != null && (
+                     (request.auth.uid == uid &&
+                      request.resource.data.uid == uid &&
+                      (request.resource.data.role == "patient" || request.resource.data.role == "doctor" || request.resource.data.role == "admin")) ||
+                     isAdmin()
+                   );
+      allow update: if request.auth != null && (
+                     (request.auth.uid == uid &&
+                      // منع تغيير role و uid بعد الإنشاء
+                      resource.data.uid == uid &&
+                      request.resource.data.uid == uid &&
+                      // التأكد من أن role لم يتغير (إذا كان موجوداً في الوثيقة الأصلية)
+                      (!('role' in resource.data) || resource.data.role == request.resource.data.role)) ||
+                     isAdmin()
+                   );
+      // الحذف: المستخدم يحذف ملفه الشخصي فقط أو admin
+      allow delete: if request.auth != null && (request.auth.uid == uid || isAdmin());
+    }
+
+    // appointments collection
+    match /appointments/{appointmentId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ مواعيدها فقط، الطبيب يقرأ مواعيد مرضاه
+      allow read: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الكتابة: المريضة والطبيب يمكنهما إنشاء المواعيد
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         (isPatientOwner(request.resource.data.patientId) ||
+          (isDoctor() && isPatientAssignedToDoctor(request.resource.data.patientId)))) ||
+        isAdmin()
+      );
+      
+      // التحديث: نفس قواعد القراءة
+      allow update: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف مواعيدها، الطبيب يحذف مواعيد مرضاه، أو admin
+      allow delete: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // medications collection
+    match /medications/{medicationId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ أدويتها فقط، الطبيب يقرأ أدوية مرضاه
+      allow read: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الكتابة: المريضة والطبيب يمكنهما إنشاء الأدوية
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         (isPatientOwner(request.resource.data.patientId) ||
+          (isDoctor() && isPatientAssignedToDoctor(request.resource.data.patientId)))) ||
+        isAdmin()
+      );
+      
+      // التحديث: نفس قواعد القراءة
+      allow update: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الحذف: المريضة تحذف أدويتها، الطبيب يحذف أدوية مرضاه، أو admin
+      allow delete: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // supportRequests collection
+    match /supportRequests/{requestId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ طلباتها فقط، Admin يمكنه قراءة كل شيء
+      allow read: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الكتابة: المريضة يمكنها إنشاء طلباتها فقط
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(request.resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // التحديث: المريضة تحدث طلباتها فقط أو admin
+      allow update: if request.auth != null && (
+        (resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الحذف: admin فقط
+      allow delete: if isAdmin();
+    }
+
+    // طلبات تسجيل الأطباء
+    match /doctorRegistrationRequests/{requestId} {
+      // دالة مساعدة: التحقق من أن الطبيب يملك هذا الطلب
+      function isRequestOwner() {
+        return request.auth != null &&
+               resource != null &&
+               resource.data.keys().hasAll(['uid']) &&
+               resource.data.uid == request.auth.uid;
+      }
+      
+      // القراءة: الطبيب يقرأ طلبه فقط، Admin يقرأ جميع الطلبات
+      allow read: if request.auth != null && (
+        isRequestOwner() ||
+        isAdmin()
+      );
+      
+      // الكتابة: أي مستخدم موثق يمكنه إنشاء طلب تسجيل (عند التسجيل)
+      allow create: if request.auth != null && (
+        request.resource.data.keys().hasAll(['uid', 'email', 'status']) &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.status == "pending"
+      );
+      
+      // التحديث: 
+      // - Admin يمكنه تحديث الطلبات (الموافقة/الرفض/طلب معلومات)
+      // - الطبيب يمكنه تحديث طلبه فقط إذا كان status == "needsInfo" (لإعادة تعيينه إلى "pending" بعد تحديث المعلومات)
+      allow update: if request.auth != null && (
+        isAdmin() ||
+        (isRequestOwner() &&
+         resource.data.status == "needsInfo" &&
+         request.resource.data.status == "pending" &&
+         request.resource.data.uid == resource.data.uid)
+      );
+      
+      // الحذف: Admin فقط
+      allow delete: if isAdmin();
+    }
+
+    // المحتوى التعليمي: الأطباء والـ Admin يمكنهم الكتابة، الجميع يمكنه القراءة
+    match /educationalContent/{contentId} {
+      // القراءة: للجميع (بما في ذلك غير المسجلين)
+      allow read: if true;
+      
+      // الكتابة: للأطباء والـ Admin فقط
+      allow create, update, delete: if request.auth != null && (
+        exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
+        (get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == "doctor" ||
+         get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == "admin")
+      );
+    }
+
+    // ملفات المريضات: المريضة ترفع ملفاتها، الطبيب يقرأ ملفات مرضاه
+    match /patientFiles/{fileId} {
+      // دالة مساعدة: التحقق من أن المريضة تملك هذا patientId
+      function isPatientOwner(patientId) {
+        return request.auth != null &&
+               exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.uid == request.auth.uid;
+      }
+      
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يتابع المريضة
+      function isPatientAssignedToDoctor(patientId) {
+        return exists(/databases/$(database)/documents/patients/$(patientId)) &&
+               get(/databases/$(database)/documents/patients/$(patientId)).data.assignedDoctor == request.auth.uid;
+      }
+      
+      // القراءة: المريضة تقرأ ملفاتها، الطبيب يقرأ ملفات مرضاه
+      allow read: if request.auth != null && (
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        (isDoctor() &&
+         resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientAssignedToDoctor(resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // الكتابة: المريضة ترفع ملفاتها فقط
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(request.resource.data.patientId)) ||
+        isAdmin()
+      );
+      
+      // التحديث: غير مسموح (لحماية البيانات)
+      allow update: if isAdmin();
+      
+      // الحذف: المريضة تحذف ملفاتها فقط
+      allow delete: if request.auth != null && (
+        (resource != null &&
+         resource.data.keys().hasAll(['patientId']) &&
+         isPatientOwner(resource.data.patientId)) ||
+        isAdmin()
+      );
+    }
+
+    // شهادات الأطباء
+    match /doctorCertificates/{certificateId} {
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يملك هذه الشهادة
+      function isCertificateOwner() {
+        return resource != null &&
+               resource.data.keys().hasAll(['doctorId']) &&
+               resource.data.doctorId == request.auth.uid;
+      }
+      
+      // القراءة: الطبيب يقرأ شهاداته، المريضات والإدمن يقرؤون شهادات الطبيب
+      allow read: if request.auth != null && (
+        (isCertificateOwner()) ||
+        isAdmin()
+      );
+      
+      // الكتابة: الطبيب يرفع شهاداته فقط
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['doctorId']) &&
+         request.resource.data.doctorId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      // التحديث: غير مسموح (لحماية البيانات)
+      allow update: if isAdmin();
+      
+      // الحذف: الطبيب يحذف شهاداته فقط
+      allow delete: if request.auth != null && (
+        (isCertificateOwner()) ||
+        isAdmin()
+      );
+    }
+
+    // المراكز الطبية: الأطباء يضيفون مراكزهم، الجميع يقرأ
+    match /medicalCenters/{centerId} {
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يملك هذا المركز
+      function isCenterOwner() {
+        return resource != null &&
+               resource.data.keys().hasAll(['doctorId']) &&
+               resource.data.doctorId == request.auth.uid;
+      }
+      
+      // القراءة: للجميع (لإظهار المراكز على الخريطة)
+      allow read: if true;
+      
+      // الكتابة: الطبيب يضيف مراكزه فقط
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['doctorId']) &&
+         request.resource.data.doctorId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      // التحديث: الطبيب يحدث مراكزه فقط
+      allow update: if request.auth != null && (
+        (isCenterOwner()) ||
+        isAdmin()
+      );
+      
+      // الحذف: الطبيب يحذف مراكزه فقط
+      allow delete: if request.auth != null && (
+        (isCenterOwner()) ||
+        isAdmin()
+      );
+    }
+
+    // تحليلات الصور الطبية: الأطباء يحفظون تحليلاتهم
+    match /medicalImageAnalyses/{analysisId} {
+      // دالة مساعدة: التحقق من أن المستخدم طبيب
+      function isDoctor() {
+        return request.auth != null && 
+               exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+      }
+      
+      // دالة مساعدة: التحقق من أن الطبيب يملك هذا التحليل
+      function isAnalysisOwner() {
+        return resource != null &&
+               resource.data.keys().hasAll(['doctorId']) &&
+               resource.data.doctorId == request.auth.uid;
+      }
+      
+      // القراءة: الطبيب يقرأ تحليلاته فقط
+      // السماح بالقراءة إذا كان doctorId في البيانات يطابق المستخدم الحالي
+      allow read: if request.auth != null && (
+        (resource != null && 
+         resource.data.keys().hasAll(['doctorId']) &&
+         resource.data.doctorId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      // الكتابة: الطبيب يحفظ تحليلاته فقط
+      allow create: if request.auth != null && (
+        (request.resource.data.keys().hasAll(['doctorId']) &&
+         request.resource.data.doctorId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      // التحديث: الطبيب يحدث تحليلاته فقط (لإعادة التسمية)
+      allow update: if request.auth != null && (
+        (isAnalysisOwner()) ||
+        isAdmin()
+      );
+      
+      // الحذف: الطبيب يحذف تحليلاته فقط
+      allow delete: if request.auth != null && (
+        (isAnalysisOwner()) ||
+        isAdmin()
+      );
+    }
+
+  }
+}
+

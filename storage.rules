@@ -1,0 +1,32 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // دالة مساعدة: التحقق من أن المستخدم admin
+    // في Storage Rules، نحتاج للتحقق من Firestore
+    function isAdmin() {
+      return request.auth != null && 
+             firestore.exists(/databases/(default)/documents/userProfiles/$(request.auth.uid)) &&
+             firestore.get(/databases/(default)/documents/userProfiles/$(request.auth.uid)).data.role == "admin";
+    }
+    
+    // ملفات المريضات
+    match /patientFiles/{patientId}/{fileName} {
+      // السماح للمستخدمين الموثقين، Admin لديه access كامل دائماً
+      allow read, write, delete: if request.auth != null;
+    }
+    
+    // شهادات الأطباء
+    match /doctorCertificates/{doctorId}/{fileName} {
+      // السماح للمستخدمين الموثقين، Admin لديه access كامل دائماً
+      allow read, write, delete: if request.auth != null;
+    }
+    
+    // أي مسار آخر - Admin فقط لديه access
+    match /{allPaths=**} {
+      allow read, write, delete: if request.auth != null && isAdmin();
+    }
+  }
+}
+
